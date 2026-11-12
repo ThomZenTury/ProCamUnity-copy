@@ -1,0 +1,199 @@
+{
+    "method": "OpenCV stereoCalibrate",
+    "intrinsics_fixed": true,
+    "camera_to_projector_rotation": [
+        [
+            0.9995211523209993,
+            0.007443713484634119,
+            0.03003426697058111
+        ],
+        [
+            0.028262687629277247,
+            -0.6147714749893539,
+            -0.7881987401838346
+        ],
+        [
+            0.012597085014850146,
+            0.7886701621520702,
+            -0.6146874724444575
+        ]
+    ],
+    "camera_to_projector_translation_mm": [
+        -73.26879667395966,
+        2228.6645669589093,
+        3195.4546115696285
+    ],
+    "camera_to_projector_matrix": [
+        [
+            0.9995211523209993,
+            0.007443713484634119,
+            0.03003426697058111,
+            -73.26879667395966
+        ],
+        [
+            0.028262687629277247,
+            -0.6147714749893539,
+            -0.7881987401838346,
+            2228.6645669589093
+        ],
+        [
+            0.012597085014850146,
+            0.7886701621520702,
+            -0.6146874724444575,
+            3195.4546115696285
+        ],
+        [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+        ]
+    ],
+    "projector_to_camera_matrix": [
+        [
+            0.9995211523209993,
+            0.028262687629277247,
+            0.012597085014850146,
+            -30.00775180870651
+        ],
+        [
+            0.007443713484634119,
+            -0.6147714749893539,
+            0.7886701621520702,
+            -1149.494911640556
+        ],
+        [
+            0.03003426697058111,
+            -0.7881987401838346,
+            -0.6146874724444575,
+            3723.0370970660033
+        ],
+        [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+        ]
+    ],
+    "projector_position_in_camera_mm": [
+        -30.00775180870651,
+        -1149.494911640556,
+        3723.0370970660033
+    ],
+    "stereo_rms_px": 12.213669439454142,
+    "validation_rms_px": 109.54731540366924,
+    "number_of_poses": 15,
+    "pose_validation": [
+        {
+            "pose": "pose_001",
+            "points": 40,
+            "camera_rms_px": 0.5221351277136366,
+            "projector_rms_px": 109.62949917708438,
+            "combined_rms_px": 77.52064149279835
+        },
+        {
+            "pose": "pose_003",
+            "points": 40,
+            "camera_rms_px": 0.18006482595571552,
+            "projector_rms_px": 52.1266002587077,
+            "combined_rms_px": 36.85929243672925
+        },
+        {
+            "pose": "pose_004",
+            "points": 40,
+            "camera_rms_px": 0.7852402101229509,
+            "projector_rms_px": 26.668277120018832,
+            "combined_rms_px": 18.865492396671147
+        },
+        {
+            "pose": "pose_006",
+            "points": 33,
+            "camera_rms_px": 0.2449240798750764,
+            "projector_rms_px": 297.02528119785796,
+            "combined_rms_px": 210.02866192316648
+        },
+        {
+            "pose": "pose_009",
+            "points": 40,
+            "camera_rms_px": 0.15063390939461344,
+            "projector_rms_px": 276.42232787825225,
+            "combined_rms_px": 195.46013153608416
+        },
+        {
+            "pose": "pose_011",
+            "points": 40,
+            "camera_rms_px": 0.803080824118001,
+            "projector_rms_px": 275.42381666635566,
+            "combined_rms_px": 194.75487635213702
+        },
+        {
+            "pose": "pose_012",
+            "points": 40,
+            "camera_rms_px": 1.5796488128297492,
+            "projector_rms_px": 260.3507234059108,
+            "combined_rms_px": 184.0991505525663
+        },
+        {
+            "pose": "pose_017",
+            "points": 40,
+            "camera_rms_px": 0.4019345172520748,
+            "projector_rms_px": 84.19282501884541,
+            "combined_rms_px": 59.533995901543854
+        },
+        {
+            "pose": "pose_018",
+            "points": 40,
+            "camera_rms_px": 0.28236049824062687,
+            "projector_rms_px": 80.30155318761928,
+            "combined_rms_px": 56.78212382341389
+        },
+        {
+            "pose": "pose_019",
+            "points": 40,
+            "camera_rms_px": 1.115823651556827,
+            "projector_rms_px": 49.011981402413845,
+            "combined_rms_px": 34.66568464210634
+        },
+        {
+            "pose": "pose_021",
+            "points": 40,
+            "camera_rms_px": 0.21577218333784115,
+            "projector_rms_px": 54.329906298487494,
+            "combined_rms_px": 38.417348138813104
+        },
+        {
+            "pose": "pose_022",
+            "points": 40,
+            "camera_rms_px": 0.2480876614280073,
+            "projector_rms_px": 40.69532735046571,
+            "combined_rms_px": 28.776476640211836
+        },
+        {
+            "pose": "pose_023",
+            "points": 40,
+            "camera_rms_px": 0.21706238448035853,
+            "projector_rms_px": 85.68417865178084,
+            "combined_rms_px": 60.588058176958654
+        },
+        {
+            "pose": "pose_027",
+            "points": 40,
+            "camera_rms_px": 0.23141637495739795,
+            "projector_rms_px": 3.7589412071902832,
+            "combined_rms_px": 2.663005119945469
+        },
+        {
+            "pose": "pose_029",
+            "points": 40,
+            "camera_rms_px": 0.7627690945465482,
+            "projector_rms_px": 140.09710515797013,
+            "combined_rms_px": 99.06508136153461
+        }
+    ],
+    "coordinate_convention": {
+        "camera": "OpenCV X right, Y down, Z forward",
+        "projector": "OpenCV X right, Y down, Z forward",
+        "translation_units": "millimetres",
+        "xtion_mounting_correction_applied": false
+    }
+}
