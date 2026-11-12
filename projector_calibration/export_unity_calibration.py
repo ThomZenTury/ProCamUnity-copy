@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """
-Export ProCamUnity calibration data to a Unity-readable JSON file.
+ProCamUnity calibration exporter.
 
-Coordinate convention:
+Input:
+    calibration_data/rgb_intrinsics.npz
+    calibration_data/depth_intrinsics.npz
+    calibration_data/rgbd_extrinsics/rgbd_calibration.npz
+    calibration_data/projector/projector_intrinsics.npz
+    calibration_data/extrinsics/camera_to_projector.npz
+    calibration_data/extrinsics/camera_to_projector.json
+
+Output:
+    calibration_data/unity_export/calibration.json
+
+Coordinate conventions:
     OpenCV: X right, Y down, Z forward
-    Unity:  X right, Y up,   Z forward
+    Unity:  X right, Y up, Z forward
 
-All translations are in millimetres.
-Image coordinates and intrinsics are in pixels.
-
-The camera-to-projector transformation is explicitly marked
-PROVISIONAL until independently validated.
+Translations: millimetres.
 """
 
 import argparse
@@ -20,35 +27,80 @@ from pathlib import Path
 import numpy as np
 
 
-# ------------------------------------------------------------
-# PROJECT PATHS
-# ------------------------------------------------------------
+# ============================================================
+# PATHS
+# ============================================================
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA = PROJECT_ROOT / "calibration_data"
+
+RGB_INTRINSICS = DATA / "rgb_intrinsics.npz"
+DEPTH_INTRINSICS = DATA / "depth_intrinsics.npz"
+
+RGBD_EXTRINSICS = (
+    DATA / "rgbd_extrinsics" / "rgbd_calibration.npz"
+)
+
+PROJECTOR_EXTRINSICS_DIR = DATA / "extrinsics"
+
+PROJECTOR_EXTRINSICS = (
+    PROJECTOR_EXTRINSICS_DIR / "camera_to_projector.npz"
+)
+
+PROJECTOR_EXTRINSICS_JSON = (
+    PROJECTOR_EXTRINSICS_DIR / "camera_to_projector.json"
+)
 
 OUTPUT_DEFAULT = (
     DATA / "unity_export" / "calibration.json"
 )
 
-# Best-performing projector model from diagnostics.
-PROJECTOR_SIMPLE_DISTORTION = np.array(
-    [0.17089973, 0.0, 0.0, 0.0, 0.0],
-    dtype=float
-)
 
-# OpenCV -> Unity coordinate basis conversion.
+# ============================================================
+# PROJECTOR INTRINSICS
+# ============================================================
+
+# Selected D_simple model.
+# These values must match the model used during
+# camera-projector extrinsic calibration.
+
+PROJECTOR_MATRIX = np.array([
+    [1265.86260, 0.0, 965.747930],
+    [0.0, 1255.15936, -118.757617],
+    [0.0, 0.0, 1.0]
+], dtype=np.float64)
+
+PROJECTOR_DISTORTION = np.array([
+    0.17089973,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+], dtype=np.float64)
+
+PROJECTOR_WIDTH = 1920
+PROJECTOR_HEIGHT = 1080
+
+PROJECTOR_MODEL = "D_simple"
+
+
+# ============================================================
+# COORDINATE CONVERSION
+# ============================================================
+
 CV_TO_UNITY = np.diag([1.0, -1.0, 1.0])
 
 
-# ------------------------------------------------------------
+# ============================================================
 # GENERAL HELPERS
-# ------------------------------------------------------------
+# ============================================================
 
 def load_npz(path):
 
     if not path.exists():
-        raise FileNotFoundError(path)
+        raise FileNotFoundError(
+            f"Calibration file not found:\n{path}"
+        )
 
     with np.load(path, allow_pickle=False) as data:
         return {
@@ -57,37 +109,32 @@ def load_npz(path):
         }
 
 
-def get_value(data, candidates, required=True):
+def get_value(data, keys, required=True):
 
-    for key in candidates:
-
+    for key in keys:
         if key in data:
             return data[key]
 
     if required:
         raise KeyError(
-            f"None of these keys found: {candidates}\n"
+            f"None of these keys found: {keys}\n"
             f"Available keys: {list(data.keys())}"
         )
 
     return None
 
 
-def scalar(value):
+def to_float(value):
+    return np.asarray(value, dtype=np.float64)
+
+
+def to_scalar(value):
     return np.asarray(value).item()
-
-
-def matrix(value):
-    return np.asarray(value, dtype=float).tolist()
-
-
-def vector(value):
-    return np.asarray(value, dtype=float).reshape(-1).tolist()
 
 
 def validate_matrix(name, value, shape):
 
-    value = np.asarray(value, dtype=float)
+    value = to_float(value)
 
     if value.shape != shape:
         raise ValueError(
@@ -104,56 +151,80 @@ def validate_rotation(name, R):
 
     R = validate_matrix(name, R, (3, 3))
 
-    determinant = np.linalg.det(R)
-
-    if not np.isclose(determinant, 1.0, atol=0.02):
+    if not np.isclose(np.linalg.det(R), 1.0, atol=0.02):
         raise ValueError(
-            f"{name} is not a valid rotation matrix. "
-            f"det(R)={determinant}"
+            f"{name}: invalid determinant "
+            f"{np.linalg.det(R)}"
         )
 
-    if not np.allclose(
-        R.T @ R,
-        np.eye(3),
-        atol=0.02
-    ):
+    if not np.allclose(R.T @ R, np.eye(3), atol=0.02):
         raise ValueError(
-            f"{name} is not orthogonal."
+            f"{name}: matrix is not orthogonal"
         )
 
     return R
 
 
+def validate_translation(name, t):
+
+    t = to_float(t).reshape(-1)
+
+    if t.size != 3:
+        raise ValueError(
+            f"{name}: expected 3 values, got {t.size}"
+        )
+
+    if not np.all(np.isfinite(t)):
+        raise ValueError(f"{name} contains NaN or Inf")
+
+    return t
+
+
 def make_transform(R, t):
 
-    T = np.eye(4)
-
+    T = np.eye(4, dtype=np.float64)
     T[:3, :3] = R
-    T[:3, 3] = np.asarray(t).reshape(3)
+    T[:3, 3] = t
 
     return T
 
 
-def cv_transform_to_unity(R, t):
+def validate_transform(name, T):
 
-    """
-    Convert a transform between two OpenCV coordinate
-    systems into Unity coordinate systems.
+    T = validate_matrix(name, T, (4, 4))
 
-    X_projector_cv = R * X_camera_cv + t
+    if not np.allclose(
+        T[3],
+        [0, 0, 0, 1],
+        atol=1e-7
+    ):
+        raise ValueError(
+            f"{name}: invalid homogeneous last row"
+        )
 
-    X_projector_unity = S * R * S * X_camera_unity + S * t
-    """
+    validate_rotation(
+        f"{name} rotation",
+        T[:3, :3]
+    )
+
+    return T
+
+
+def transform_to_unity(R, t):
 
     S = CV_TO_UNITY
 
     R_unity = S @ R @ S
-    t_unity = S @ np.asarray(t).reshape(3)
+    t_unity = S @ t
 
     return make_transform(R_unity, t_unity)
 
 
-def intrinsic_data(path, name):
+# ============================================================
+# INTRINSICS
+# ============================================================
+
+def load_intrinsics(path, name):
 
     data = load_npz(path)
 
@@ -163,21 +234,37 @@ def intrinsic_data(path, name):
         (3, 3)
     )
 
-    distortion = vector(
-        get_value(data, ["distortion", "dist_coeffs"])
+    distortion_value = get_value(
+        data,
+        [
+            "distortion",
+            "dist_coeffs",
+            "distortion_coefficients"
+        ],
+        required=False
     )
 
-    width = int(scalar(
+    if distortion_value is None:
+        distortion = np.zeros(5, dtype=np.float64)
+        distortion_status = "NOT_CALIBRATED"
+    else:
+        distortion = to_float(
+            distortion_value
+        ).reshape(-1)
+        distortion_status = "CALIBRATED"
+
+    width = int(to_scalar(
         get_value(data, ["image_width", "width"])
     ))
 
-    height = int(scalar(
+    height = int(to_scalar(
         get_value(data, ["image_height", "height"])
     ))
 
     return {
-        "camera_matrix": matrix(K),
-        "distortion": distortion,
+        "camera_matrix": K.tolist(),
+        "distortion": distortion.tolist(),
+        "distortion_status": distortion_status,
         "resolution": {
             "width": width,
             "height": height
@@ -185,58 +272,138 @@ def intrinsic_data(path, name):
     }
 
 
-# ------------------------------------------------------------
-# TRANSFORMATION LOADING
-# ------------------------------------------------------------
+def load_projector_intrinsics():
+
+    return {
+        "camera_matrix": PROJECTOR_MATRIX.tolist(),
+        "distortion": PROJECTOR_DISTORTION.tolist(),
+        "distortion_model": PROJECTOR_MODEL,
+        "resolution": {
+            "width": PROJECTOR_WIDTH,
+            "height": PROJECTOR_HEIGHT
+        }
+    }
+
+
+# ============================================================
+# CAMERA-PROJECTOR EXTRINSICS
+# ============================================================
 
 def load_camera_projector_extrinsics():
 
-    path = DATA / "extrinsics" / "camera_to_projector.npz"
+    print("\nLoading camera-projector extrinsics...")
 
-    data = load_npz(path)
+    data = load_npz(PROJECTOR_EXTRINSICS)
 
-    R = get_value(
+    print("Available NPZ keys:")
+
+    for key, value in data.items():
+        print(f"  {key:40s} {value.shape}")
+
+    # Current calibration script saves:
+    #
+    # R_camera_to_projector       (3,3)
+    # T_camera_to_projector_mm    (3,)
+    # T_camera_to_projector       (4,4)
+    # T_projector_to_camera       (4,4)
+
+    T_value = get_value(
         data,
         [
-            "rotation_camera_to_projector",
-            "rotation",
-            "R",
-            "R_camera_to_projector"
-        ]
-    )
-
-    t = get_value(
-        data,
-        [
-            "translation_camera_to_projector",
-            "translation",
-            "t",
             "T_camera_to_projector",
-            "tvec"
-        ]
+            "camera_to_projector_matrix"
+        ],
+        required=False
     )
 
-    R = validate_rotation(
-        "Camera-to-projector rotation", R
+    if T_value is not None:
+
+        T = validate_transform(
+            "Camera-to-projector transformation",
+            T_value
+        )
+
+        R = T[:3, :3].copy()
+        t = T[:3, 3].copy()
+
+    else:
+
+        R = validate_rotation(
+            "Camera-to-projector rotation",
+            get_value(
+                data,
+                [
+                    "R_camera_to_projector",
+                    "rotation_camera_to_projector",
+                    "rotation",
+                    "R"
+                ]
+            )
+        )
+
+        t = validate_translation(
+            "Camera-to-projector translation",
+            get_value(
+                data,
+                [
+                    "T_camera_to_projector_mm",
+                    "translation_camera_to_projector_mm",
+                    "translation_camera_to_projector",
+                    "translation",
+                    "t",
+                    "tvec"
+                ]
+            )
+        )
+
+        T = make_transform(R, t)
+
+    R_saved = get_value(
+        data,
+        ["R_camera_to_projector"],
+        required=False
     )
 
-    t = np.asarray(t, dtype=float).reshape(3)
+    t_saved = get_value(
+        data,
+        ["T_camera_to_projector_mm"],
+        required=False
+    )
 
-    if not np.all(np.isfinite(t)):
-        raise ValueError("Invalid camera-to-projector translation")
+    if R_saved is not None:
+        if not np.allclose(R, R_saved, atol=1e-7):
+            raise ValueError(
+                "Rotation and transformation matrices disagree."
+            )
+
+    if t_saved is not None:
+        if not np.allclose(
+            t,
+            np.asarray(t_saved).reshape(3),
+            atol=1e-7
+        ):
+            raise ValueError(
+                "Translation and transformation matrices disagree."
+            )
+
+    print("\nCamera-to-projector rotation:")
+    print(R)
+
+    print("\nCamera-to-projector translation (mm):")
+    print(t)
 
     return R, t
 
 
+# ============================================================
+# RGB-D EXTRINSICS
+# ============================================================
+
 def load_rgbd_extrinsics():
 
-    path = (
-        DATA /
-        "rgbd_extrinsics" /
-        "rgbd_calibration.npz"
-    )
+    print("\nLoading RGB-D extrinsics...")
 
-    data = load_npz(path)
+    data = load_npz(RGBD_EXTRINSICS)
 
     R = validate_rotation(
         "Depth-to-RGB rotation",
@@ -246,96 +413,87 @@ def load_rgbd_extrinsics():
         )
     )
 
-    t = np.asarray(
+    t = validate_translation(
+        "Depth-to-RGB translation",
         get_value(
             data,
             ["translation_depth_to_rgb_mm"]
-        ),
-        dtype=float
-    ).reshape(3)
-
-    scale = float(
-        scalar(
-            get_value(data, ["depth_scale"])
         )
     )
 
-    return R, t, scale
+    depth_scale = float(to_scalar(
+        get_value(data, ["depth_scale"])
+    ))
+
+    return R, t, depth_scale
 
 
-# ------------------------------------------------------------
+# ============================================================
+# QUALITY INFORMATION
+# ============================================================
+
+def load_quality_report():
+
+    if not PROJECTOR_EXTRINSICS_JSON.exists():
+        return {
+            "status": "PROVISIONAL",
+            "note": "Extrinsics JSON report unavailable."
+        }
+
+    with open(
+        PROJECTOR_EXTRINSICS_JSON,
+        "r",
+        encoding="utf-8"
+    ) as f:
+        report = json.load(f)
+
+    return {
+        "status": "PROVISIONAL",
+        "method": report.get("method", "Unknown"),
+        "intrinsic_model": report.get(
+            "intrinsic_model",
+            PROJECTOR_MODEL
+        ),
+        "initial_rms_px": report.get("initial_rms_px"),
+        "final_rms_px": report.get("final_rms_px"),
+        "validation": report.get("validation", {}),
+        "number_of_poses": report.get("number_of_poses"),
+        "notes": [
+            "Camera-projector extrinsics are provisional.",
+            "Independent physical validation is required.",
+            "Xtion mounting correction has not been applied."
+        ]
+    }
+
+
+# ============================================================
 # EXPORT
-# ------------------------------------------------------------
+# ============================================================
 
-def export(output, projector_model):
+def export(output):
 
-    print("\nUNITY CALIBRATION EXPORT")
-    print("=" * 60)
+    print("\n" + "=" * 65)
+    print("UNITY CALIBRATION EXPORT")
+    print("=" * 65)
+
+    print(f"\nProject root: {PROJECT_ROOT}")
+    print(f"Calibration data: {DATA}")
 
     # Intrinsics
 
-    rgb = intrinsic_data(
-        DATA / "rgb_intrinsics.npz",
+    print("\nLoading intrinsic calibrations...")
+
+    rgb = load_intrinsics(
+        RGB_INTRINSICS,
         "RGB"
     )
 
-    depth = intrinsic_data(
-        DATA / "depth_intrinsics.npz",
+    depth = load_intrinsics(
+        DEPTH_INTRINSICS,
         "Depth"
     )
 
-    projector_npz = load_npz(
-        DATA / "projector" / "projector_intrinsics.npz"
-    )
-
-    projector_K = validate_matrix(
-        "Projector camera matrix",
-        get_value(
-            projector_npz,
-            ["camera_matrix", "K"]
-        ),
-        (3, 3)
-    )
-
-    projector_width = int(scalar(
-        get_value(
-            projector_npz,
-            ["image_width", "width"]
-        )
-    ))
-
-    projector_height = int(scalar(
-        get_value(
-            projector_npz,
-            ["image_height", "height"]
-        )
-    ))
-
-    if projector_model == "D_simple":
-
-        projector_distortion = (
-            PROJECTOR_SIMPLE_DISTORTION.copy()
-        )
-
-    else:
-
-        projector_distortion = np.asarray(
-            get_value(
-                projector_npz,
-                ["distortion", "dist_coeffs"]
-            ),
-            dtype=float
-        ).reshape(-1)
-
-    projector = {
-        "camera_matrix": matrix(projector_K),
-        "distortion": vector(projector_distortion),
-        "distortion_model": projector_model,
-        "resolution": {
-            "width": projector_width,
-            "height": projector_height
-        }
-    }
+    projector = load_projector_intrinsics()
 
     # Extrinsics
 
@@ -343,12 +501,16 @@ def export(output, projector_model):
 
     R_rgbd, t_rgbd, depth_scale = load_rgbd_extrinsics()
 
-    T_projector_from_rgb = cv_transform_to_unity(
-        R_pc, t_pc
+    # Convert transformations to Unity coordinates.
+
+    T_projector_from_rgb = transform_to_unity(
+        R_pc,
+        t_pc
     )
 
-    T_rgb_from_depth = cv_transform_to_unity(
-        R_rgbd, t_rgbd
+    T_rgb_from_depth = transform_to_unity(
+        R_rgbd,
+        t_rgbd
     )
 
     T_rgb_from_projector = np.linalg.inv(
@@ -359,9 +521,43 @@ def export(output, projector_model):
         T_rgb_from_depth
     )
 
-    # Calibration quality
+    # Validate transformations.
 
-    extrinsics_status = "PROVISIONAL"
+    transformations = {
+        "projector_from_rgb": T_projector_from_rgb,
+        "rgb_from_projector": T_rgb_from_projector,
+        "rgb_from_depth": T_rgb_from_depth,
+        "depth_from_rgb": T_depth_from_rgb
+    }
+
+    print("\nTransformation checks:")
+    print("-" * 65)
+
+    for name, T in transformations.items():
+        validate_transform(name, T)
+        print(f"{name:30s}: OK")
+
+    # Verify inverse consistency.
+
+    if not np.allclose(
+        T_projector_from_rgb @ T_rgb_from_projector,
+        np.eye(4),
+        atol=1e-7
+    ):
+        raise ValueError(
+            "RGB/projector inverse check failed."
+        )
+
+    if not np.allclose(
+        T_rgb_from_depth @ T_depth_from_rgb,
+        np.eye(4),
+        atol=1e-7
+    ):
+        raise ValueError(
+            "RGB/depth inverse check failed."
+        )
+
+    # Assemble output.
 
     calibration = {
 
@@ -376,14 +572,14 @@ def export(output, projector_model):
         },
 
         "coordinate_convention": {
-            "camera": "Unity: X right, Y up, Z forward",
-            "projector": "Unity: X right, Y up, Z forward",
+
+            "opencv": "X right, Y down, Z forward",
+
+            "unity": "X right, Y up, Z forward",
+
             "matrix_convention": (
-                "4x4 row arrays; column-vector multiplication"
-            ),
-            "source_conversion": (
-                "OpenCV to Unity using diag(1,-1,1) "
-                "for both coordinate frames"
+                "4x4 matrices, row-major JSON arrays, "
+                "column-vector multiplication"
             )
         },
 
@@ -395,41 +591,37 @@ def export(output, projector_model):
 
         "depth": {
             "scale": depth_scale,
-            "scale_applied": False,
-            "note": (
-                "Apply the depth scale when converting "
-                "raw sensor values to millimetres."
-            )
+            "scale_applied": False
         },
 
         "extrinsics": {
 
-            "status": extrinsics_status,
+            "status": "PROVISIONAL",
 
-            "rgb_from_depth": matrix(
-                T_rgb_from_depth
+            "projector_from_rgb": (
+                T_projector_from_rgb.tolist()
             ),
 
-            "depth_from_rgb": matrix(
-                T_depth_from_rgb
+            "rgb_from_projector": (
+                T_rgb_from_projector.tolist()
             ),
 
-            "projector_from_rgb": matrix(
-                T_projector_from_rgb
+            "rgb_from_depth": (
+                T_rgb_from_depth.tolist()
             ),
 
-            "rgb_from_projector": matrix(
-                T_rgb_from_projector
+            "depth_from_rgb": (
+                T_depth_from_rgb.tolist()
             ),
 
-            "camera_to_projector_source": {
-                "rotation_opencv": matrix(R_pc),
-                "translation_opencv_mm": vector(t_pc)
+            "camera_to_projector_source_opencv": {
+                "rotation": R_pc.tolist(),
+                "translation_mm": t_pc.tolist()
             },
 
-            "depth_to_rgb_source": {
-                "rotation_opencv": matrix(R_rgbd),
-                "translation_opencv_mm": vector(t_rgbd)
+            "depth_to_rgb_source_opencv": {
+                "rotation": R_rgbd.tolist(),
+                "translation_mm": t_rgbd.tolist()
             }
         },
 
@@ -437,53 +629,28 @@ def export(output, projector_model):
 
             "rgb_intrinsic_rms_px": 0.36416646,
 
-            "projector_intrinsic_rms_px": 0.49097510,
-
             "rgbd_extrinsic_rms_mm": 4.18838749,
 
-            "projector_extrinsic_validation_rms_px": 11.70417,
+            "projector_intrinsic_model": PROJECTOR_MODEL,
 
-            "projector_extrinsic_validated": False,
+            "projector_intrinsic_rms_px": 0.3720,
 
-            "notes": [
-                "Camera-to-projector transformation is provisional.",
-                "Do not interpret provisional extrinsics as "
-                "a validated physical calibration.",
-                "Projector distortion model must match "
-                "the model used to generate projector coordinates."
-            ]
+            "projector_extrinsics": load_quality_report()
         }
     }
 
-    # Final consistency checks
-
-    for name, transform in [
-        ("RGB from depth", T_rgb_from_depth),
-        ("Projector from RGB", T_projector_from_rgb)
-    ]:
-
-        if not np.all(np.isfinite(transform)):
-            raise ValueError(
-                f"Invalid transformation: {name}"
-            )
-
-        if not np.allclose(
-            transform[3],
-            [0, 0, 0, 1],
-            atol=1e-8
-        ):
-            raise ValueError(
-                f"Invalid homogeneous matrix: {name}"
-            )
-
-    # Save
+    # Save JSON.
 
     output.parent.mkdir(
         parents=True,
         exist_ok=True
     )
 
-    with open(output, "w") as f:
+    with open(
+        output,
+        "w",
+        encoding="utf-8"
+    ) as f:
 
         json.dump(
             calibration,
@@ -492,57 +659,49 @@ def export(output, projector_model):
             allow_nan=False
         )
 
-    print("\nLOADED CALIBRATION")
-    print("-" * 60)
+    # Summary.
+
+    print("\n" + "=" * 65)
+    print("UNITY EXPORT COMPLETE")
+    print("=" * 65)
 
     print(
-        f"RGB camera: "
-        f"{rgb['resolution']['width']} x "
+        f"RGB: {rgb['resolution']['width']} x "
         f"{rgb['resolution']['height']}"
     )
 
     print(
-        f"Depth camera: "
-        f"{depth['resolution']['width']} x "
+        f"Depth: {depth['resolution']['width']} x "
         f"{depth['resolution']['height']}"
     )
 
     print(
-        f"Projector: "
-        f"{projector_width} x {projector_height}"
+        f"Projector: {PROJECTOR_WIDTH} x "
+        f"{PROJECTOR_HEIGHT}"
     )
+
+    print(f"Projector model: {PROJECTOR_MODEL}")
 
     print(
-        f"Depth scale: {depth_scale}"
+        f"Depth distortion: {depth['distortion_status']}"
     )
 
-    print("\nEXTRINSICS")
-    print("-" * 60)
+    print("Extrinsics status: PROVISIONAL")
 
-    print("Projector from RGB:")
-    print(np.array(T_projector_from_rgb))
+    print(f"\nOutput:\n{output}")
 
-    print("\nRGB from depth:")
-    print(np.array(T_rgb_from_depth))
-
-    print("\nCALIBRATION STATUS")
-    print("-" * 60)
-
-    print("Camera-to-projector: PROVISIONAL")
-    print("Projector distortion:", projector_model)
-
-    print("\nEXPORT COMPLETE")
-    print("=" * 60)
-    print(f"Output: {output}")
+    print("=" * 65)
 
 
-# ------------------------------------------------------------
+# ============================================================
 # MAIN
-# ------------------------------------------------------------
+# ============================================================
 
 def main():
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Export ProCamUnity calibration."
+    )
 
     parser.add_argument(
         "--output",
@@ -550,18 +709,9 @@ def main():
         default=OUTPUT_DEFAULT
     )
 
-    parser.add_argument(
-        "--projector-model",
-        choices=["D_simple", "A_full"],
-        default="D_simple"
-    )
-
     args = parser.parse_args()
 
-    export(
-        args.output,
-        args.projector_model
-    )
+    export(args.output)
 
 
 if __name__ == "__main__":
