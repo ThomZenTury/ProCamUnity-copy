@@ -8,6 +8,8 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 
+from scipy.optimize import least_squares
+
 
 # ============================================================
 # PATHS
@@ -182,6 +184,262 @@ def prepare_poses(data):
     print("\nUsable poses:", len(poses))
 
     return poses
+
+def project_points(obj, rvec, tvec, K, dist):
+    projected, _ = cv2.projectPoints(
+        obj, rvec, tvec, K, dist
+    )
+    return projected.reshape(-1, 2)
+
+
+def optimize_joint_stereo(poses, initial_R, initial_T):
+
+    print("\nJOINT NONLINEAR STEREO OPTIMIZATION")
+    print("=" * 65)
+
+    # Initialize each checkerboard pose from camera observations.
+    board_poses = []
+
+    for pose in poses:
+        result = solve_planar_pnp(
+            pose["object"],
+            pose["camera"],
+            CAMERA_MATRIX,
+            CAMERA_DISTORTION
+        )
+
+        board_poses.append((
+            result["rvec"].reshape(3),
+            result["tvec"].reshape(3)
+        ))
+
+    global_rvec, _ = cv2.Rodrigues(initial_R)
+
+    # Parameter vector:
+    # global rotation (3)
+    # global translation (3)
+    # individual board poses (6 per pose)
+
+    x0 = np.concatenate([
+        global_rvec.reshape(3),
+        initial_T.reshape(3),
+        *[
+            np.concatenate([r, t])
+            for r, t in board_poses
+        ]
+    ])
+
+    def residuals(parameters):
+
+        rvec_pc = parameters[:3]
+        t_pc = parameters[3:6].reshape(3, 1)
+
+        R_pc, _ = cv2.Rodrigues(rvec_pc)
+
+        all_residuals = []
+
+        for i, pose in enumerate(poses):
+
+            offset = 6 + i * 6
+
+            rvec_cb = parameters[offset:offset + 3]
+            t_cb = parameters[offset + 3:offset + 6].reshape(3, 1)
+
+            obj = pose["object"]
+
+            # Camera prediction.
+            predicted_camera = project_points(
+                obj,
+                rvec_cb,
+                t_cb,
+                CAMERA_MATRIX,
+                CAMERA_DISTORTION
+            )
+
+            # Transform checkerboard into projector coordinates.
+            R_cb, _ = cv2.Rodrigues(rvec_cb)
+
+            R_pb = R_pc @ R_cb
+            t_pb = R_pc @ t_cb + t_pc
+
+            rvec_pb, _ = cv2.Rodrigues(R_pb)
+
+            predicted_projector = project_points(
+                obj,
+                rvec_pb,
+                t_pb,
+                PROJECTOR_MATRIX,
+                PROJECTOR_DISTORTION
+            )
+
+            # Normalize by image measurement uncertainty.
+            camera_error = (
+                predicted_camera - pose["camera"]
+            ).reshape(-1)
+
+            projector_error = (
+                predicted_projector - pose["projector"]
+            ).reshape(-1)
+
+            all_residuals.extend(camera_error)
+            all_residuals.extend(projector_error)
+
+        return np.asarray(all_residuals)
+
+    print("Initial residual evaluation...")
+
+    initial_rms = np.sqrt(
+        np.mean(residuals(x0) ** 2)
+    )
+
+    print(f"Initial RMS: {initial_rms:.4f} px")
+    print("Running nonlinear optimization...")
+
+    result = least_squares(
+        residuals,
+        x0,
+        method="trf",
+        loss="soft_l1",
+        f_scale=1.0,
+        x_scale="jac",
+        max_nfev=3000,
+        verbose=1
+    )
+
+    if not result.success:
+        print("WARNING:", result.message)
+
+    parameters = result.x
+
+    R_pc, _ = cv2.Rodrigues(
+        parameters[:3]
+    )
+
+    T_pc = parameters[3:6].reshape(3)
+
+    print("\nOptimization complete.")
+    print("Converged:", result.success)
+    print("Function evaluations:", result.nfev)
+    print("Final robust cost:", result.cost)
+
+    return {
+        "R": R_pc,
+        "T": T_pc,
+        "parameters": parameters,
+        "optimization": result,
+        "initial_rms": float(initial_rms),
+        "final_rms": float(
+            np.sqrt(np.mean(residuals(parameters) ** 2))
+        )
+    }
+
+
+def validate_joint_solution(poses, solution):
+
+    parameters = solution["parameters"]
+
+    R_pc = solution["R"]
+    T_pc = solution["T"].reshape(3, 1)
+
+    results = []
+
+    camera_squared = 0.0
+    projector_squared = 0.0
+    total_points = 0
+
+    print("\nJOINT TRANSFORMATION VALIDATION")
+    print("=" * 65)
+
+    for i, pose in enumerate(poses):
+
+        offset = 6 + i * 6
+
+        rvec_cb = parameters[offset:offset + 3]
+        t_cb = parameters[offset + 3:offset + 6].reshape(3, 1)
+
+        obj = pose["object"]
+
+        predicted_camera = project_points(
+            obj,
+            rvec_cb,
+            t_cb,
+            CAMERA_MATRIX,
+            CAMERA_DISTORTION
+        )
+
+        R_cb, _ = cv2.Rodrigues(rvec_cb)
+
+        R_pb = R_pc @ R_cb
+        t_pb = R_pc @ t_cb + T_pc
+
+        rvec_pb, _ = cv2.Rodrigues(R_pb)
+
+        predicted_projector = project_points(
+            obj,
+            rvec_pb,
+            t_pb,
+            PROJECTOR_MATRIX,
+            PROJECTOR_DISTORTION
+        )
+
+        camera_errors = np.linalg.norm(
+            predicted_camera - pose["camera"],
+            axis=1
+        )
+
+        projector_errors = np.linalg.norm(
+            predicted_projector - pose["projector"],
+            axis=1
+        )
+
+        camera_rms = float(
+            np.sqrt(np.mean(camera_errors ** 2))
+        )
+
+        projector_rms = float(
+            np.sqrt(np.mean(projector_errors ** 2))
+        )
+
+        camera_squared += np.sum(camera_errors ** 2)
+        projector_squared += np.sum(projector_errors ** 2)
+        total_points += len(obj)
+
+        results.append({
+            "pose": pose["name"],
+            "points": len(obj),
+            "camera_rms_px": camera_rms,
+            "projector_rms_px": projector_rms,
+            "camera_max_px": float(camera_errors.max()),
+            "projector_max_px": float(projector_errors.max())
+        })
+
+        print(
+            f"{pose['name']:12s} "
+            f"Camera: {camera_rms:.3f} px | "
+            f"Projector: {projector_rms:.3f} px"
+        )
+
+    camera_rms = np.sqrt(camera_squared / total_points)
+    projector_rms = np.sqrt(projector_squared / total_points)
+
+    combined_rms = np.sqrt(
+        (camera_squared + projector_squared)
+        / (2 * total_points)
+    )
+
+    print("\nVALIDATION SUMMARY")
+    print("-" * 65)
+    print(f"Camera RMS:     {camera_rms:.4f} px")
+    print(f"Projector RMS:  {projector_rms:.4f} px")
+    print(f"Combined RMS:   {combined_rms:.4f} px")
+
+    return {
+        "poses": results,
+        "camera_rms_px": float(camera_rms),
+        "projector_rms_px": float(projector_rms),
+        "combined_rms_px": float(combined_rms)
+    }
+
 
 # ============================================================
 # JOINT CAMERA-PROJECTOR STEREO CALIBRATION
@@ -1567,74 +1825,102 @@ def main():
     print("Dataset:", DATASET)
 
     data = load_data()
-
     poses = prepare_poses(data)
 
-    # Joint stereo calibration.
-    calibration = calibrate_stereo(poses)
+    # Initial estimate from existing independent PnP method.
+    pose_results = calculate_pose_transformations(poses)
 
-    # Independent validation.
-    validation, aggregate_rms = validate_stereo(
-        poses,
-        calibration
+    initial_consensus = calculate_consensus(
+        pose_results
     )
 
-    R = calibration["R"]
-    T = calibration["T"]
+    print("\nINITIAL TRANSFORMATION")
+    print(initial_consensus["R"])
+    print(initial_consensus["T"])
 
-    T_camera_to_projector = np.eye(4)
-    T_camera_to_projector[:3, :3] = R
-    T_camera_to_projector[:3, 3] = T
+    # Joint optimization.
+    solution = optimize_joint_stereo(
+        poses,
+        initial_consensus["R"],
+        initial_consensus["T"]
+    )
 
-    R_inverse = R.T
-    T_inverse = -R_inverse @ T
+    # Independent validation of the optimized result.
+    validation = validate_joint_solution(
+        poses,
+        solution
+    )
 
-    T_projector_to_camera = np.eye(4)
-    T_projector_to_camera[:3, :3] = R_inverse
-    T_projector_to_camera[:3, 3] = T_inverse
+    R = solution["R"]
+    T = solution["T"]
 
-    # Save NPZ.
+    T_cp, T_pc, projector_position = calculate_matrices(
+        R, T
+    )
+
+    print("\nFINAL CAMERA-TO-PROJECTOR TRANSFORMATION")
+    print("=" * 65)
+
+    print("\nRotation:")
+    print(R)
+
+    print("\nTranslation (mm):")
+    print(T)
+
+    print("\nProjector optical centre in camera coordinates:")
+    print(projector_position)
+
+    print("\nSAVING RESULTS")
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
     np.savez_compressed(
         OUTPUT_DIR / "camera_to_projector.npz",
 
         R_camera_to_projector=R,
         T_camera_to_projector_mm=T,
 
-        T_camera_to_projector=T_camera_to_projector,
-        T_projector_to_camera=T_projector_to_camera,
+        T_camera_to_projector=T_cp,
+        T_projector_to_camera=T_pc,
 
-        projector_position_camera_mm=calibration["projector_position"],
-
-        stereo_rms=calibration["rms"],
-        validation_rms=aggregate_rms,
+        projector_position_camera_mm=projector_position,
 
         camera_matrix=CAMERA_MATRIX,
         camera_distortion=CAMERA_DISTORTION,
 
         projector_matrix=PROJECTOR_MATRIX,
-        projector_distortion=PROJECTOR_DISTORTION
+        projector_distortion=PROJECTOR_DISTORTION,
+
+        optimization_parameters=solution["parameters"],
+
+        xtion_mounting_correction_applied=False
     )
 
-    # Save JSON.
     report = {
-        "method": "OpenCV stereoCalibrate",
-        "intrinsics_fixed": True,
+        "method": "Joint nonlinear camera-projector optimization",
+        "intrinsic_model": "D_simple",
 
         "camera_to_projector_rotation": R.tolist(),
         "camera_to_projector_translation_mm": T.tolist(),
 
-        "camera_to_projector_matrix": T_camera_to_projector.tolist(),
-        "projector_to_camera_matrix": T_projector_to_camera.tolist(),
+        "camera_to_projector_matrix": T_cp.tolist(),
+        "projector_to_camera_matrix": T_pc.tolist(),
 
         "projector_position_in_camera_mm":
-            calibration["projector_position"].tolist(),
-
-        "stereo_rms_px": calibration["rms"],
-        "validation_rms_px": aggregate_rms,
+            projector_position.tolist(),
 
         "number_of_poses": len(poses),
 
-        "pose_validation": validation,
+        "initial_rms_px": solution["initial_rms"],
+        "final_rms_px": solution["final_rms"],
+
+        "optimization_success":
+            bool(solution["optimization"].success),
+
+        "optimization_message":
+            str(solution["optimization"].message),
+
+        "validation": validation,
 
         "coordinate_convention": {
             "camera": "OpenCV X right, Y down, Z forward",
@@ -1648,10 +1934,8 @@ def main():
         OUTPUT_DIR / "camera_to_projector.json",
         "w"
     ) as f:
-
         json.dump(report, f, indent=4)
 
-    # Save CSV.
     with open(
         OUTPUT_DIR / "stereo_validation.csv",
         "w",
@@ -1660,32 +1944,27 @@ def main():
 
         writer = csv.DictWriter(
             f,
-            fieldnames=[
-                "pose",
-                "points",
-                "camera_rms_px",
-                "projector_rms_px",
-                "combined_rms_px"
-            ]
+            fieldnames=validation["poses"][0].keys()
         )
 
         writer.writeheader()
-        writer.writerows(validation)
-
-    print("\n")
-    print("=" * 65)
-    print("JOINT STEREO CALIBRATION COMPLETE")
-    print("=" * 65)
-
-    print("Stereo RMS:", calibration["rms"])
-    print("Validation RMS:", aggregate_rms)
+        writer.writerows(validation["poses"])
 
     print("\nSaved files:")
     print(OUTPUT_DIR / "camera_to_projector.json")
     print(OUTPUT_DIR / "camera_to_projector.npz")
     print(OUTPUT_DIR / "stereo_validation.csv")
 
-    print("\nXtion mounting correction: NOT APPLIED")
+    print("\n" + "=" * 65)
+    print("JOINT CALIBRATION COMPLETE")
+    print("=" * 65)
+
+    print("Initial RMS:", solution["initial_rms"])
+    print("Final RMS:", solution["final_rms"])
+    print("Validation RMS:", validation["combined_rms_px"])
+
+    print("Xtion mounting correction: NOT APPLIED")
+
 
 
 
