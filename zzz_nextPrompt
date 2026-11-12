@@ -1,0 +1,25 @@
+Under https://github.com/ThomZenTury/ProCamUnity-copy you can find the current project and we left off when you said:
+
+5. Our next development stages
+
+I suggest we follow this order:
+
+    Verify Gray-code decoding.
+    Improve decoding reliability if necessary.
+    Calculate projector intrinsics.
+    Calculate camera-to-projector extrinsics.
+    Validate reprojection accuracy.
+    Combine the projector and camera coordinate systems.
+    Apply the Xtion mounting correction.
+    Export Unity-compatible position, rotation and projection parameters.
+
+The ultimate objective: Unity should reproduce the real-world projection accurately, including the projector's physical position, orientation, field of view and lens characteristics.
+
+Let's first get the three inspection images. Then we can move on to calculating the projector calibration.
+
+Her e are the images:
+https://github.com/ThomZenTury/ProCamUnity-copy/blob/main/inspection_coordinates.png
+https://github.com/ThomZenTury/ProCamUnity-copy/blob/main/inspection_valid_mask.png
+https://github.com/ThomZenTury/ProCamUnity-copy/blob/main/inspection_camera.png
+
+So let's resume and start from there not forgetting that the Xtion camera is mounted upside down.
