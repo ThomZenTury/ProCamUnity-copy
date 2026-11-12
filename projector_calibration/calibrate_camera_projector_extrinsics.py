@@ -183,6 +183,319 @@ def prepare_poses(data):
 
     return poses
 
+# ============================================================
+# JOINT CAMERA-PROJECTOR STEREO CALIBRATION
+# ============================================================
+
+def calibrate_stereo(poses):
+
+    print("\n")
+    print("=" * 65)
+    print("JOINT CAMERA-PROJECTOR STEREO CALIBRATION")
+    print("=" * 65)
+
+    object_points = []
+    camera_points = []
+    projector_points = []
+
+    for pose in poses:
+
+        object_points.append(
+            pose["object"].astype(np.float32).reshape(-1, 1, 3)
+        )
+
+        camera_points.append(
+            pose["camera"].astype(np.float32).reshape(-1, 1, 2)
+        )
+
+        projector_points.append(
+            pose["projector"].astype(np.float32).reshape(-1, 1, 2)
+        )
+
+    camera_matrix = CAMERA_MATRIX.copy()
+    camera_distortion = CAMERA_DISTORTION.reshape(1, -1).copy()
+
+    projector_matrix = PROJECTOR_MATRIX.copy()
+    projector_distortion = PROJECTOR_DISTORTION.reshape(1, -1).copy()
+
+    flags = cv2.CALIB_FIX_INTRINSIC
+
+    criteria = (
+        cv2.TERM_CRITERIA_EPS +
+        cv2.TERM_CRITERIA_MAX_ITER,
+        200,
+        1e-10
+    )
+
+    print("Calibration poses:", len(poses))
+    print("Camera resolution:", CAMERA_SIZE)
+    print("Projector resolution:", PROJECTOR_SIZE)
+    print("Intrinsics: FIXED")
+    print("Optimization: JOINT STEREO CALIBRATION")
+
+    result = cv2.stereoCalibrate(
+        object_points,
+        camera_points,
+        projector_points,
+
+        camera_matrix,
+        camera_distortion,
+
+        projector_matrix,
+        projector_distortion,
+
+        CAMERA_SIZE,
+
+        criteria=criteria,
+        flags=flags
+    )
+
+    (
+        rms,
+        K1,
+        D1,
+        K2,
+        D2,
+        R,
+        T,
+        E,
+        F
+    ) = result
+
+    # Verify that OpenCV did not alter the fixed intrinsics.
+    if not np.allclose(K1, CAMERA_MATRIX):
+        raise RuntimeError("Camera intrinsics unexpectedly changed.")
+
+    if not np.allclose(K2, PROJECTOR_MATRIX):
+        raise RuntimeError("Projector intrinsics unexpectedly changed.")
+
+    projector_position = -R.T @ T.reshape(3)
+
+    print("\nSTEREO CALIBRATION RESULT")
+    print("-" * 65)
+
+    print("Stereo RMS:", rms)
+
+    print("\nCamera -> Projector rotation:")
+    print(R)
+
+    print("\nCamera -> Projector translation (mm):")
+    print(T.reshape(3))
+
+    print("\nProjector optical centre in camera coordinates (mm):")
+    print(projector_position)
+
+    return {
+        "R": R,
+        "T": T.reshape(3),
+        "E": E,
+        "F": F,
+        "rms": float(rms),
+        "projector_position": projector_position
+    }
+
+
+# ============================================================
+# PLANAR PNP CANDIDATES
+# ============================================================
+
+def get_pnp_candidates(obj, img, K, D):
+
+    result = cv2.solvePnPGeneric(
+        obj,
+        img,
+        K,
+        D,
+        flags=cv2.SOLVEPNP_IPPE
+    )
+
+    if not result[0]:
+        raise RuntimeError("IPPE failed.")
+
+    candidates = []
+
+    for rvec, tvec in zip(result[1], result[2]):
+
+        rvec = np.asarray(rvec).reshape(3, 1)
+        tvec = np.asarray(tvec).reshape(3, 1)
+
+        R, _ = cv2.Rodrigues(rvec)
+
+        points_3d = R @ obj.T + tvec
+
+        if np.any(points_3d[2] <= 0):
+            continue
+
+        projected, _ = cv2.projectPoints(
+            obj,
+            rvec,
+            tvec,
+            K,
+            D
+        )
+
+        errors = np.linalg.norm(
+            projected.reshape(-1, 2) - img,
+            axis=1
+        )
+
+        candidates.append({
+            "R": R,
+            "rvec": rvec,
+            "tvec": tvec,
+            "rms": float(np.sqrt(np.mean(errors ** 2)))
+        })
+
+    if not candidates:
+        raise RuntimeError("No valid PnP solutions.")
+
+    return candidates
+
+
+# ============================================================
+# VALIDATE JOINT TRANSFORMATION
+# ============================================================
+
+def validate_stereo(poses, calibration):
+
+    R_PC = calibration["R"]
+    t_PC = calibration["T"].reshape(3, 1)
+
+    results = []
+
+    total_squared_error = 0.0
+    total_points = 0
+
+    print("\n")
+    print("=" * 65)
+    print("JOINT TRANSFORMATION VALIDATION")
+    print("=" * 65)
+
+    for pose in poses:
+
+        name = pose["name"]
+
+        obj = pose["object"]
+        cam = pose["camera"]
+        proj = pose["projector"]
+
+        candidates = get_pnp_candidates(
+            obj,
+            cam,
+            CAMERA_MATRIX,
+            CAMERA_DISTORTION
+        )
+
+        best = None
+
+        for candidate in candidates:
+
+            R_CB = candidate["R"]
+            t_CB = candidate["tvec"]
+
+            # Board pose in projector coordinates.
+            R_PB = R_PC @ R_CB
+            t_PB = R_PC @ t_CB + t_PC
+
+            if np.any((R_PB @ obj.T + t_PB)[2] <= 0):
+                continue
+
+            rvec_PB, _ = cv2.Rodrigues(R_PB)
+
+            predicted_camera, _ = cv2.projectPoints(
+                obj,
+                candidate["rvec"],
+                t_CB,
+                CAMERA_MATRIX,
+                CAMERA_DISTORTION
+            )
+
+            predicted_projector, _ = cv2.projectPoints(
+                obj,
+                rvec_PB,
+                t_PB,
+                PROJECTOR_MATRIX,
+                PROJECTOR_DISTORTION
+            )
+
+            camera_errors = np.linalg.norm(
+                predicted_camera.reshape(-1, 2) - cam,
+                axis=1
+            )
+
+            projector_errors = np.linalg.norm(
+                predicted_projector.reshape(-1, 2) - proj,
+                axis=1
+            )
+
+            camera_rms = float(
+                np.sqrt(np.mean(camera_errors ** 2))
+            )
+
+            projector_rms = float(
+                np.sqrt(np.mean(projector_errors ** 2))
+            )
+
+            # Combined score for selecting the planar PnP solution.
+            combined_rms = float(
+                np.sqrt(
+                    (
+                        np.sum(camera_errors ** 2) +
+                        np.sum(projector_errors ** 2)
+                    ) /
+                    (2 * len(obj))
+                )
+            )
+
+            if best is None or combined_rms < best["combined_rms"]:
+
+                best = {
+                    "camera_rms": camera_rms,
+                    "projector_rms": projector_rms,
+                    "combined_rms": combined_rms,
+                    "camera_errors": camera_errors,
+                    "projector_errors": projector_errors
+                }
+
+        if best is None:
+            raise RuntimeError(
+                f"No valid joint PnP solution for {name}"
+            )
+
+        n = len(obj)
+
+        total_squared_error += (
+            np.sum(best["camera_errors"] ** 2) +
+            np.sum(best["projector_errors"] ** 2)
+        )
+
+        total_points += 2 * n
+
+        results.append({
+            "pose": name,
+            "points": n,
+            "camera_rms_px": best["camera_rms"],
+            "projector_rms_px": best["projector_rms"],
+            "combined_rms_px": best["combined_rms"]
+        })
+
+        print(
+            f"{name:12s} "
+            f"Camera: {best['camera_rms']:.3f} px | "
+            f"Projector: {best['projector_rms']:.3f} px | "
+            f"Combined: {best['combined_rms']:.3f} px"
+        )
+
+    aggregate_rms = float(
+        np.sqrt(total_squared_error / total_points)
+    )
+
+    print("\nAggregate combined reprojection RMS:")
+    print(f"{aggregate_rms:.4f} px")
+
+    return results, aggregate_rms
+
+
 
 # ============================================================
 # PLANAR PNP
@@ -1137,111 +1450,243 @@ def create_plot(
 # MAIN
 # ============================================================
 
-def main():
+# def main():
 
-    # global consensus_results
+#     # global consensus_results
+
+#     print("\n")
+#     print("=" * 65)
+
+#     print("CAMERA-PROJECTOR PER-POSE EXTRINSIC CALIBRATION")
+
+#     print("=" * 65)
+
+#     print("Dataset:", DATASET)
+
+#     print("Projector intrinsic model: D_simple")
+
+#     data = load_data()
+
+#     poses = prepare_poses(data)
+
+#     pose_comparison = calculate_pose_transformations(
+#         poses
+#     )
+
+#     # consensus_results = pose_comparison
+
+#     consensus = calculate_consensus(
+#         pose_comparison
+#     )
+
+#     print("\n")
+#     print("=" * 65)
+
+#     print("FINAL CAMERA-TO-PROJECTOR TRANSFORMATION")
+
+#     print("=" * 65)
+
+#     print("\nRotation:")
+
+#     print(consensus["R"])
+
+#     print("\nTranslation (mm):")
+
+#     print(consensus["T"])
+
+#     _, _, projector_position = calculate_matrices(
+#         consensus["R"],
+#         consensus["T"]
+#     )
+
+#     print("\nProjector optical centre in camera coordinates:")
+
+#     print(projector_position)
+
+#     print("\nAccepted poses:")
+
+#     print(np.sum(consensus["inliers"]))
+
+#     print("Rejected poses:")
+
+#     print(
+#         len(consensus["inliers"]) -
+#         np.sum(consensus["inliers"])
+#     )
+
+#     # validation_results = validate_final_transformation(
+#     #     poses,
+#     #     consensus
+#     # )
+
+#     successful_names = {
+#         r["name"] for r in pose_comparison
+#     }
+
+#     successful_poses = [
+#         p for p in poses
+#         if p["name"] in successful_names
+#     ]
+
+#     validation_results = validate_final_transformation(
+#         successful_poses,
+#         consensus,
+#         pose_comparison
+#     )
+
+#     save_results(
+#         consensus,
+#         # validation_results,
+#         validation_results,
+#         pose_comparison
+#     )
+
+#     create_plot(
+#         pose_comparison,
+#         validation_results,
+#         consensus
+#     )
+
+#     print("\n")
+#     print("=" * 65)
+
+#     print("PER-POSE EXTRINSIC CALIBRATION COMPLETE")
+
+#     print("=" * 65)
+
+#     print("Output:", OUTPUT_DIR)
+
+
+def main():
 
     print("\n")
     print("=" * 65)
-
-    print("CAMERA-PROJECTOR PER-POSE EXTRINSIC CALIBRATION")
-
+    print("CAMERA-PROJECTOR JOINT EXTRINSIC CALIBRATION")
     print("=" * 65)
 
     print("Dataset:", DATASET)
-
-    print("Projector intrinsic model: D_simple")
 
     data = load_data()
 
     poses = prepare_poses(data)
 
-    pose_comparison = calculate_pose_transformations(
-        poses
+    # Joint stereo calibration.
+    calibration = calibrate_stereo(poses)
+
+    # Independent validation.
+    validation, aggregate_rms = validate_stereo(
+        poses,
+        calibration
     )
 
-    # consensus_results = pose_comparison
+    R = calibration["R"]
+    T = calibration["T"]
 
-    consensus = calculate_consensus(
-        pose_comparison
+    T_camera_to_projector = np.eye(4)
+    T_camera_to_projector[:3, :3] = R
+    T_camera_to_projector[:3, 3] = T
+
+    R_inverse = R.T
+    T_inverse = -R_inverse @ T
+
+    T_projector_to_camera = np.eye(4)
+    T_projector_to_camera[:3, :3] = R_inverse
+    T_projector_to_camera[:3, 3] = T_inverse
+
+    # Save NPZ.
+    np.savez_compressed(
+        OUTPUT_DIR / "camera_to_projector.npz",
+
+        R_camera_to_projector=R,
+        T_camera_to_projector_mm=T,
+
+        T_camera_to_projector=T_camera_to_projector,
+        T_projector_to_camera=T_projector_to_camera,
+
+        projector_position_camera_mm=calibration["projector_position"],
+
+        stereo_rms=calibration["rms"],
+        validation_rms=aggregate_rms,
+
+        camera_matrix=CAMERA_MATRIX,
+        camera_distortion=CAMERA_DISTORTION,
+
+        projector_matrix=PROJECTOR_MATRIX,
+        projector_distortion=PROJECTOR_DISTORTION
     )
 
-    print("\n")
-    print("=" * 65)
+    # Save JSON.
+    report = {
+        "method": "OpenCV stereoCalibrate",
+        "intrinsics_fixed": True,
 
-    print("FINAL CAMERA-TO-PROJECTOR TRANSFORMATION")
+        "camera_to_projector_rotation": R.tolist(),
+        "camera_to_projector_translation_mm": T.tolist(),
 
-    print("=" * 65)
+        "camera_to_projector_matrix": T_camera_to_projector.tolist(),
+        "projector_to_camera_matrix": T_projector_to_camera.tolist(),
 
-    print("\nRotation:")
+        "projector_position_in_camera_mm":
+            calibration["projector_position"].tolist(),
 
-    print(consensus["R"])
+        "stereo_rms_px": calibration["rms"],
+        "validation_rms_px": aggregate_rms,
 
-    print("\nTranslation (mm):")
+        "number_of_poses": len(poses),
 
-    print(consensus["T"])
+        "pose_validation": validation,
 
-    _, _, projector_position = calculate_matrices(
-        consensus["R"],
-        consensus["T"]
-    )
-
-    print("\nProjector optical centre in camera coordinates:")
-
-    print(projector_position)
-
-    print("\nAccepted poses:")
-
-    print(np.sum(consensus["inliers"]))
-
-    print("Rejected poses:")
-
-    print(
-        len(consensus["inliers"]) -
-        np.sum(consensus["inliers"])
-    )
-
-    # validation_results = validate_final_transformation(
-    #     poses,
-    #     consensus
-    # )
-
-    successful_names = {
-        r["name"] for r in pose_comparison
+        "coordinate_convention": {
+            "camera": "OpenCV X right, Y down, Z forward",
+            "projector": "OpenCV X right, Y down, Z forward",
+            "translation_units": "millimetres",
+            "xtion_mounting_correction_applied": False
+        }
     }
 
-    successful_poses = [
-        p for p in poses
-        if p["name"] in successful_names
-    ]
+    with open(
+        OUTPUT_DIR / "camera_to_projector.json",
+        "w"
+    ) as f:
 
-    validation_results = validate_final_transformation(
-        successful_poses,
-        consensus,
-        pose_comparison
-    )
+        json.dump(report, f, indent=4)
 
-    save_results(
-        consensus,
-        # validation_results,
-        validation_results,
-        pose_comparison
-    )
+    # Save CSV.
+    with open(
+        OUTPUT_DIR / "stereo_validation.csv",
+        "w",
+        newline=""
+    ) as f:
 
-    create_plot(
-        pose_comparison,
-        validation_results,
-        consensus
-    )
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "pose",
+                "points",
+                "camera_rms_px",
+                "projector_rms_px",
+                "combined_rms_px"
+            ]
+        )
+
+        writer.writeheader()
+        writer.writerows(validation)
 
     print("\n")
     print("=" * 65)
-
-    print("PER-POSE EXTRINSIC CALIBRATION COMPLETE")
-
+    print("JOINT STEREO CALIBRATION COMPLETE")
     print("=" * 65)
 
-    print("Output:", OUTPUT_DIR)
+    print("Stereo RMS:", calibration["rms"])
+    print("Validation RMS:", aggregate_rms)
+
+    print("\nSaved files:")
+    print(OUTPUT_DIR / "camera_to_projector.json")
+    print(OUTPUT_DIR / "camera_to_projector.npz")
+    print(OUTPUT_DIR / "stereo_validation.csv")
+
+    print("\nXtion mounting correction: NOT APPLIED")
+
 
 
 if __name__ == "__main__":
